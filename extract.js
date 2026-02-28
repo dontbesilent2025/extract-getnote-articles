@@ -48,8 +48,49 @@ const COOKIES = [
   }
 ];
 
+// 连续跳过多少篇后提前终止（认为后续都是旧内容）
+const CONSECUTIVE_SKIP_THRESHOLD = 10;
+
 function sanitizeFilename(title) {
   return title.replace(/[<>:"/\\|?*#]/g, '').substring(0, 100).trim();
+}
+
+// === Manifest 相关 ===
+
+function getManifestPath(outputDir) {
+  return path.join(outputDir, '.manifest.json');
+}
+
+function readManifest(outputDir) {
+  const manifestPath = getManifestPath(outputDir);
+  if (fs.existsSync(manifestPath)) {
+    try {
+      return JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+    } catch (e) {
+      console.log('⚠️  manifest 文件损坏，重新初始化');
+    }
+  }
+  return { lastRun: null, articles: {} };
+}
+
+function writeManifest(outputDir, manifest) {
+  const manifestPath = getManifestPath(outputDir);
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf-8');
+}
+
+// 获取输出目录中已有文件的最大编号
+function getMaxFileIndex(outputDir) {
+  if (!fs.existsSync(outputDir)) return 0;
+  const files = fs.readdirSync(outputDir);
+  let maxIndex = 0;
+  for (const file of files) {
+    const match = file.match(/^(\d{3})_/);
+    if (match) {
+      const num = parseInt(match[1], 10);
+      if (num > maxIndex) maxIndex = num;
+    }
+  }
+  return maxIndex;
 }
 
 async function extractArticleContent(page, detailUrl) {
@@ -146,13 +187,19 @@ async function fetchArticleUrls(page, baseUrl, articles, currentPage) {
 }
 
 // 并行处理单篇文章
-async function processArticle(context, article, outputDir, globalIndex, startTime, totalSavedRef) {
+async function processArticle(context, article, outputDir, globalIndex, startTime, totalSavedRef, manifest) {
+  // 先查 manifest 是否已抓过该 URL
+  if (article.detailUrl && manifest.articles[article.detailUrl]) {
+    console.log(`  [${globalIndex}] ⏭️  ${article.title.substring(0, 40)}... - manifest 已记录，跳过`);
+    return { skipped: true, saved: false };
+  }
+
   const filename = `${String(globalIndex).padStart(3, '0')}_${sanitizeFilename(article.title)}.md`;
   const filepath = path.join(outputDir, filename);
 
-  // 检查文件是否已存在（断点续传）
+  // 文件存在性检查作为兜底
   if (fs.existsSync(filepath)) {
-    console.log(`  [${globalIndex}] ⏭️  ${article.title.substring(0, 40)}... - 已存在，跳过`);
+    console.log(`  [${globalIndex}] ⏭️  ${article.title.substring(0, 40)}... - 文件已存在，跳过`);
     return { skipped: true, saved: false };
   }
 
@@ -183,6 +230,14 @@ ${content.mainContent}
 
         fs.writeFileSync(filepath, markdown, 'utf-8');
         totalSavedRef.count++;
+
+        // 写入 manifest
+        manifest.articles[article.detailUrl] = {
+          title: article.title,
+          file: filename,
+          scrapedAt: new Date().toISOString()
+        };
+        writeManifest(outputDir, manifest);
 
         // 计算并显示实时统计
         const elapsedMinutes = (Date.now() - startTime) / 1000 / 60;
@@ -243,6 +298,17 @@ async function main() {
     fs.mkdirSync(outputDir, { recursive: true });
   }
 
+  // 读取 manifest（增量抓取状态）
+  const manifest = readManifest(outputDir);
+  const manifestCount = Object.keys(manifest.articles).length;
+  if (manifestCount > 0) {
+    console.log(`📋 manifest 中已有 ${manifestCount} 篇文章记录，将进行增量抓取`);
+  }
+  manifest.lastRun = new Date().toISOString();
+
+  // 获取已有文件的最大编号，新文章接续编号
+  let nextIndex = getMaxFileIndex(outputDir) + 1;
+
   // 记录开始时间
   const startTime = Date.now();
 
@@ -281,6 +347,7 @@ async function main() {
   // 使用对象引用来跟踪计数（用于并行处理）
   const totalSavedRef = { count: 0 };
   let totalSkipped = 0;
+  let consecutiveSkips = 0;
   let currentPage = 1;
 
   while (maxPages === 0 || currentPage <= maxPages) {
@@ -426,6 +493,7 @@ async function main() {
 
       // 步骤2：并行提取文章内容（分批处理）
       console.log('\n📝 步骤2: 并行提取内容...');
+      let earlyStop = false;
       for (let i = 0; i < articlesWithUrls.length; i += concurrency) {
         // 检查是否收到停止信号
         if (shouldStop) {
@@ -439,25 +507,42 @@ async function main() {
           break;
         }
 
+        // 检查连续跳过是否达到阈值
+        if (consecutiveSkips >= CONSECUTIVE_SKIP_THRESHOLD) {
+          console.log(`\n⏩ 连续跳过 ${consecutiveSkips} 篇已抓取文章，后续内容视为旧内容，提前停止`);
+          earlyStop = true;
+          break;
+        }
+
         // 获取当前批次的文章
         const batch = articlesWithUrls.slice(i, Math.min(i + concurrency, articlesWithUrls.length));
 
-        // 并行处理当前批次
+        // 并行处理当前批次，使用接续编号
         const promises = batch.map((article, batchIndex) => {
-          const globalIndex = (currentPage - 1) * 20 + i + batchIndex + 1;
-          return processArticle(context, article, outputDir, globalIndex, startTime, totalSavedRef);
+          const globalIndex = nextIndex + batchIndex;
+          return processArticle(context, article, outputDir, globalIndex, startTime, totalSavedRef, manifest);
         });
 
         const results = await Promise.all(promises);
 
-        // 统计结果
+        // 统计结果，更新连续跳过计数器和编号
+        let savedInBatch = 0;
         results.forEach(result => {
-          if (result.skipped) totalSkipped++;
+          if (result.skipped) {
+            totalSkipped++;
+            consecutiveSkips++;
+          } else {
+            consecutiveSkips = 0;
+            if (result.saved) savedInBatch++;
+          }
         });
+
+        // 只有实际保存了文章才推进编号
+        nextIndex += savedInBatch;
       }
 
-      // 检查是否收到停止信号
-      if (shouldStop) {
+      // 检查是否收到停止信号或提前终止
+      if (shouldStop || earlyStop) {
         break;
       }
 
@@ -468,6 +553,9 @@ async function main() {
       break;
     }
   }
+
+  // 保存最终 manifest
+  writeManifest(outputDir, manifest);
 
   await context.close();
 

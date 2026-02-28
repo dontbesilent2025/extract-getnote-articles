@@ -4,6 +4,6 @@
   "description": "Get笔记文案提取工具",
   "main": "extract.js",
   "dependencies": {
-    "playwright": "^1.40.0"
+    "playwright": "^1.58.2"
   }
 }
