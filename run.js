@@ -33,18 +33,9 @@ function isFullUrl(input) {
   return input.startsWith('http://') || input.startsWith('https://');
 }
 
-// 获取不冲突的文件夹名
-function getUniqueOutputDir(baseName) {
-  let outputDir = `./${baseName}`;
-  let counter = 2;
-
-  // 如果文件夹已存在，添加序号
-  while (fs.existsSync(outputDir)) {
-    outputDir = `./${baseName}_${counter}`;
-    counter++;
-  }
-
-  return outputDir;
+// 获取输出目录（复用已有目录以支持增量抓取）
+function getOutputDir(baseName) {
+  return `./${baseName}`;
 }
 
 async function main() {
@@ -75,8 +66,8 @@ async function main() {
     outputDirName = followName || topicId;
   }
 
-  // 获取不冲突的输出目录
-  const outputDir = getUniqueOutputDir(outputDirName);
+  // 获取输出目录（复用已有目录以支持增量抓取）
+  const outputDir = getOutputDir(outputDirName);
   const finalDirName = path.basename(outputDir);
 
   console.log('=== Get笔记文案提取工具 ===');
